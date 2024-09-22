@@ -20,6 +20,9 @@ from transformers import (
     PhrasalConstraint,
     PreTrainedModel,
     StoppingCriteriaList,
+    TemperatureLogitsWarper,
+    TopKLogitsWarper,
+    TopPLogitsWarper,
 )
 from transformers.generation.utils import GenerateOutput, SampleOutput, logger
 
@@ -178,15 +181,34 @@ class NewGenerationMixin(GenerationMixin):
         model_kwargs["output_attentions"] = generation_config.output_attentions
         model_kwargs["output_hidden_states"] = generation_config.output_hidden_states
         model_kwargs["use_cache"] = generation_config.use_cache
+        model_kwargs["cache_position"] = torch.Tensor([0]).to(inputs_tensor.device)
 
         accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys())
         requires_attention_mask = "encoder_outputs" not in model_kwargs
 
         if model_kwargs.get("attention_mask", None) is None and requires_attention_mask and accepts_attention_mask:
+            setattr(
+                generation_config,
+                "_pad_token_tensor",
+                torch.full(
+                    (inputs_tensor.shape[0], inputs_tensor.shape[1]),
+                    generation_config.pad_token_id,
+                    device=inputs_tensor.device
+                )
+            )
+            setattr(
+                generation_config,
+                "_eos_token_tensor",
+                torch.full(
+                    (inputs_tensor.shape[0], inputs_tensor.shape[1]),
+                    generation_config.eos_token_id,
+                    device=inputs_tensor.device
+                )
+            )
             model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(
                 inputs_tensor,
-                generation_config.pad_token_id,
-                generation_config.eos_token_id,
+                generation_config._pad_token_tensor,
+                generation_config._eos_token_tensor,
             )
 
         # decoder-only models should use left-padding for generation
@@ -384,7 +406,7 @@ class NewGenerationMixin(GenerationMixin):
 
         elif is_sample_gen_mode:
             # 11. prepare logits warper
-            logits_warper = self._get_logits_warper(generation_config)
+            logits_warper = _get_logits_warper(generation_config)
 
             # 12. expand input_ids with `num_return_sequences` additional sequences per batch
             input_ids, model_kwargs = self._expand_inputs_for_generation(
@@ -409,7 +431,7 @@ class NewGenerationMixin(GenerationMixin):
             )
         elif is_sample_gen_stream_mode:
             # 11. prepare logits warper
-            logits_warper = self._get_logits_warper(generation_config)
+            logits_warper = _get_logits_warper(generation_config)
 
             # 12. expand input_ids with `num_return_sequences` additional sequences per batch
             input_ids, model_kwargs = self._expand_inputs_for_generation(
@@ -471,7 +493,7 @@ class NewGenerationMixin(GenerationMixin):
 
         elif is_beam_sample_gen_mode:
             # 11. prepare logits warper
-            logits_warper = self._get_logits_warper(generation_config)
+            logits_warper = _get_logits_warper(generation_config)
 
             if stopping_criteria.max_length is None:
                 raise ValueError("`max_length` needs to be a stopping_criteria for now.")
@@ -928,3 +950,17 @@ if __name__ == "__main__":
             chunk = tokenizer.decode(x, skip_special_tokens=True)
             stream_result += chunk
         print(stream_result)
+
+
+def _get_logits_warper(generation_config: GenerationConfig) -> LogitsProcessorList:
+
+    warpers = LogitsProcessorList()
+
+    if generation_config.temperature is not None and generation_config.temperature != 1.0:
+        warpers.append(TemperatureLogitsWarper(generation_config.temperature))
+    if generation_config.top_k is not None and generation_config.top_k != 0:
+        warpers.append(TopKLogitsWarper(top_k=generation_config.top_k, min_tokens_to_keep=1))
+    if generation_config.top_p is not None and generation_config.top_p < 1.0:
+        warpers.append(TopPLogitsWarper(top_p=generation_config.top_p, min_tokens_to_keep=1))
+
+    return warpers
